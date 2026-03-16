@@ -1,0 +1,33 @@
+[package]
+name = "jewellery_azure_cutter"
+version = "0.1.0"
+edition = "2021"
+description = "Automatic azure (à jour) cuts on jewellery STL meshes — reduces metal weight while maintaining structural integrity"
+license = "MIT"
+
+[dependencies]
+# STL file I/O
+stl_io = "0.8"
+
+# CSG boolean operations (difference for azure cuts)
+# Using f64 feature for precision (jewellery tolerances are sub-mm)
+csgrs = { version = "0.20", default-features = false, features = ["f64", "stl-io", "delaunay"] }
+
+# 3D geometry queries (f64 variant to match csgrs)
+parry3d-f64 = "0.17"
+nalgebra = "0.33"
+
+# Configuration file parsing
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"

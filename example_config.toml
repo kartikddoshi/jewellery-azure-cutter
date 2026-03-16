@@ -1,0 +1,17 @@
+# jewellery-azure-cutter configuration
+# All dimensions in millimeters, angles in degrees.
+
+[input]
+stl_file = "ring.stl"
+# output_file = "ring_azure.stl"   # Optional — defaults to "<input>_azure.stl"
+
+[stone]
+stone_type = "round"      # Only "round" supported currently
+diameter_min = 0.8        # Min hole diameter to detect as stone seat (mm)
+diameter_max = 10.0       # Max hole diameter to detect as stone seat (mm)
+
+[azure]
+min_wall_thickness = 0.5  # Metal remaining at bottom of azure cut (mm)
+min_rib_width = 0.4       # Min metal between adjacent azure cuts (mm)
+taper_angle = 30.0        # Sidewall taper angle from vertical (degrees)
+seat_margin = 0.2         # Radial safety zone around stone hole edge (mm)
