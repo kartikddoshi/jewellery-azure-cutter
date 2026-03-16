@@ -36,20 +36,68 @@ pub struct StoneConfig {
 }
 
 /// Azure cut generation parameters.
+///
+/// The azure cutter is shaped like a chimney:
+///   - TOP: A cylinder matching the stone hole, extending inward
+///   - BOTTOM: A tapered rectangular pyramid widening toward the inner surface
+///
+/// ```text
+///        ┌──────┐         ← Stone hole (circle)
+///        │      │
+///        │ CYLNDR│  ← girdle_distance deep
+///        │      │
+///        ├──┐┌──┤         ← step (flat ledge at transition)
+///       /   ││   \
+///      / PYRAMID  \  ← taper controls the widening angle
+///     /     ││     \
+///    └──────┘└──────┘     ← bottom rectangle on inner surface
+/// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct AzureConfig {
-    /// Minimum metal thickness remaining at bottom of cut (mm).
-    #[serde(default = "default_min_wall_thickness")]
-    pub min_wall_thickness: f64,
-    /// Minimum metal width between adjacent azure cuts (mm).
-    #[serde(default = "default_min_rib_width")]
-    pub min_rib_width: f64,
-    /// Taper angle of azure sidewalls (degrees from vertical).
+    // --- Cylinder (top) zone ---
+
+    /// Distance the cylinder extends below the stone girdle (mm).
+    /// This is how deep the straight bore goes before the pyramid begins.
+    #[serde(default = "default_girdle_distance")]
+    pub girdle_distance: f64,
+
+    // --- Pyramid (bottom) zone ---
+
+    /// Taper angle of the pyramid walls from vertical (degrees).
+    /// Controls how quickly the rectangle widens from the cylinder base.
     #[serde(default = "default_taper_angle")]
     pub taper_angle: f64,
-    /// Radial safety margin around stone hole edge (mm).
+
+    /// Height of the flat step/ledge at the cylinder-to-pyramid transition (mm).
+    /// 0.0 means no step — direct transition.
+    #[serde(default = "default_step_height")]
+    pub step_height: f64,
+
+    /// How far the cut extends below/past the inner surface (mm).
+    /// Ensures the boolean fully pierces through.
+    #[serde(default = "default_overhang")]
+    pub overhang: f64,
+
+    // --- Wall constraints ---
+
+    /// Minimum metal thickness at the inner surface / bottom of cut (mm).
+    #[serde(default = "default_min_wall_thickness")]
+    pub min_wall_thickness: f64,
+
+    /// Minimum metal rib width between adjacent azure cuts (mm).
+    /// This constrains the bottom rectangle dimensions.
+    #[serde(default = "default_min_rib_width")]
+    pub min_rib_width: f64,
+
+    /// Radial safety margin around stone hole edge in the cylinder zone (mm).
     #[serde(default = "default_seat_margin")]
     pub seat_margin: f64,
+
+    // --- Resolution ---
+
+    /// Number of segments for the cylinder cross-section (polygon approximation).
+    #[serde(default = "default_cylinder_segments")]
+    pub cylinder_segments: usize,
 }
 
 // --- Defaults ---
@@ -57,10 +105,14 @@ pub struct AzureConfig {
 fn default_stone_type() -> String { "round".to_string() }
 fn default_diameter_min() -> f64 { 0.8 }
 fn default_diameter_max() -> f64 { 10.0 }
+fn default_girdle_distance() -> f64 { 0.5 }
+fn default_taper_angle() -> f64 { 15.0 }
+fn default_step_height() -> f64 { 0.0 }
+fn default_overhang() -> f64 { 0.1 }
 fn default_min_wall_thickness() -> f64 { 0.5 }
 fn default_min_rib_width() -> f64 { 0.4 }
-fn default_taper_angle() -> f64 { 30.0 }
 fn default_seat_margin() -> f64 { 0.2 }
+fn default_cylinder_segments() -> usize { 32 }
 
 impl Config {
     /// Load configuration from a TOML file.
@@ -84,6 +136,18 @@ impl Config {
             "diameter_min must be > 0 and < diameter_max"
         );
         anyhow::ensure!(
+            self.azure.girdle_distance >= 0.0,
+            "girdle_distance must be >= 0"
+        );
+        anyhow::ensure!(
+            self.azure.taper_angle >= 0.0 && self.azure.taper_angle < 90.0,
+            "taper_angle must be between 0 and 90 degrees"
+        );
+        anyhow::ensure!(
+            self.azure.step_height >= 0.0,
+            "step_height must be >= 0"
+        );
+        anyhow::ensure!(
             self.azure.min_wall_thickness > 0.0,
             "min_wall_thickness must be > 0"
         );
@@ -92,12 +156,12 @@ impl Config {
             "min_rib_width must be > 0"
         );
         anyhow::ensure!(
-            self.azure.taper_angle > 0.0 && self.azure.taper_angle < 90.0,
-            "taper_angle must be between 0 and 90 degrees"
-        );
-        anyhow::ensure!(
             self.azure.seat_margin >= 0.0,
             "seat_margin must be >= 0"
+        );
+        anyhow::ensure!(
+            self.azure.cylinder_segments >= 8,
+            "cylinder_segments must be >= 8"
         );
         Ok(())
     }

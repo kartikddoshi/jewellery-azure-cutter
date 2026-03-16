@@ -11,7 +11,18 @@ diameter_min = 0.8        # Min hole diameter to detect as stone seat (mm)
 diameter_max = 10.0       # Max hole diameter to detect as stone seat (mm)
 
 [azure]
-min_wall_thickness = 0.5  # Metal remaining at bottom of azure cut (mm)
+# --- Cylinder (top zone) ---
+girdle_distance = 0.5     # Depth of straight cylinder below stone girdle (mm)
+
+# --- Pyramid (bottom zone) ---
+taper_angle = 15.0        # Pyramid wall taper from vertical (degrees)
+step_height = 0.0         # Flat ledge at cylinder-to-pyramid transition (mm). 0 = no step.
+overhang = 0.1            # How far cut extends past inner surface for clean boolean (mm)
+
+# --- Wall constraints ---
+min_wall_thickness = 0.5  # Metal remaining at inner surface / bottom of cut (mm)
 min_rib_width = 0.4       # Min metal between adjacent azure cuts (mm)
-taper_angle = 30.0        # Sidewall taper angle from vertical (degrees)
 seat_margin = 0.2         # Radial safety zone around stone hole edge (mm)
+
+# --- Resolution ---
+cylinder_segments = 32    # Polygon segments for the cylinder cross-section

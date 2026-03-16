@@ -3,7 +3,7 @@
 //! Pipeline:
 //! 1. Load config (TOML) + STL mesh
 //! 2. Detect stone seats (boundary loops → circle fitting → filtering)
-//! 3. Generate azure cutters (ray-projected ruled surfaces, geometry-adaptive)
+//! 3. Generate azure cutters (chimney shape: cylinder + rectangular pyramid)
 //! 4. Boolean subtract cutters from ring mesh
 //! 5. Write output STL
 
@@ -86,8 +86,8 @@ fn main() -> Result<()> {
 
     log::info!("Detected {} stone seats", seats.len());
 
-    // 4. Generate azure cutters (ray-projected onto inner surface geometry)
-    let cutters = azure::generate_azure_cutters(&seats, &ring_mesh, &cfg.azure, 32);
+    // 4. Generate azure cutters (chimney shape: cylinder top + rect pyramid bottom)
+    let cutters = azure::generate_azure_cutters(&seats, &ring_mesh, &cfg.azure);
     log::info!("Generated {} cutters", cutters.len());
 
     // 5. Boolean subtract

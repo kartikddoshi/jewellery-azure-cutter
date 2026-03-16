@@ -1,21 +1,60 @@
 //! Azure cutter generation module.
 //!
-//! GEOMETRY PHILOSOPHY:
-//! An azure cutter is NOT a simple cone or frustum. It is a **ruled surface**
-//! connecting two boundaries:
-//!   - TOP boundary: a circle on the outer surface (defined by the stone hole)
-//!   - BOTTOM boundary: the projection of that circle onto the inner surface,
-//!     pulled back by min_wall_thickness
+//! CORRECT GEOMETRY — "Chimney" shape:
 //!
-//! The bottom shape varies depending on the inner surface geometry:
-//!   - Flat surface     → circle (trivial case)
-//!   - Cylindrical band → ellipse (stretched along band direction)
-//!   - S-curve/comfort  → asymmetric freeform curve
-//!   - Dome/sphere      → warped circle (non-uniform scaling)
+//! An azure cutter is NOT a cone or frustum. It has two distinct zones:
 //!
-//! We handle ALL cases by ray-projecting each point on the top circle
-//! down to the inner surface. This produces the correct bottom boundary
-//! regardless of the inner surface shape.
+//!   ZONE 1 (top) — CYLINDER:
+//!     A straight cylindrical bore matching the stone hole diameter.
+//!     Extends inward from the stone seat by `girdle_distance`.
+//!     This is where the diamond sits and is held.
+//!
+//!   ZONE 2 (bottom) — RECTANGULAR TRUNCATED PYRAMID:
+//!     Below the cylinder, the shape transitions to a rectangular
+//!     cross-section that widens toward the inner surface.
+//!     The bottom face is a rectangle whose dimensions are governed by
+//!     the spacing between neighboring stones minus rib walls.
+//!
+//! ```text
+//!  Side view (cross section):
+//!
+//!         ┌────────┐          ← Stone hole (circle, radius r)
+//!         │        │
+//!         │ CYLNDR │  ← girdle_distance
+//!         │        │
+//!         ├─┐    ┌─┤          ← step (optional flat ledge)
+//!        /  │    │  \
+//!       / TRUNCATED  \  ← taper_angle controls widening
+//!      /   PYRAMID    \
+//!     └────────────────┘      ← bottom rectangle (w × h)
+//!     ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔      ← inner surface
+//!
+//!  Top view (looking down through the stone):
+//!
+//!         ╭──────╮    ← cylinder (circle)
+//!        ╱        ╲
+//!       ╱  ╭────╮  ╲
+//!      │   │    │   │ ← inscribed circle transitions to rectangle
+//!       ╲  ╰────╯  ╱
+//!        ╲        ╱
+//!         ╰──────╯
+//!
+//!  Bottom view (looking at inner surface):
+//!
+//!     ┌──────────────┐  ← rectangle (derived from neighbor grid)
+//!     │              │
+//!     │   ╭──────╮   │  ← where cylinder projects through
+//!     │   ╰──────╯   │
+//!     │              │
+//!     └──────────────┘
+//! ```
+//!
+//! The bottom rectangle dimensions come from the neighbor layout:
+//!   width  = distance_to_neighbor_along_row - min_rib_width
+//!   height = distance_to_neighbor_across_row - min_rib_width
+//!
+//! On curved surfaces, the bottom rectangle is projected (ray-cast)
+//! onto the actual inner mesh geometry.
 
 use crate::config::AzureConfig;
 use crate::detect::StoneSeat;
@@ -28,57 +67,64 @@ use std::f64::consts::PI;
 pub struct AzureCutter {
     /// The stone seat this cutter belongs to.
     pub seat_id: usize,
-    /// Triangle mesh of the cutter solid.
+    /// Triangle mesh of the cutter solid (chimney shape).
     pub mesh: TriMesh,
-    /// Top radius used (at stone side).
-    pub top_radius: f64,
-    /// Per-sample projected depths (for diagnostics).
-    pub sample_depths: Vec<f64>,
+    /// Cylinder radius (top zone).
+    pub cylinder_radius: f64,
+    /// Bottom rectangle half-widths [half_w, half_h] (bottom zone).
+    pub bottom_half_extents: [f64; 2],
 }
 
 /// Generate azure cutters for all detected stone seats.
 ///
-/// This is the core algorithm:
-/// 1. For each seat, sample the top circle boundary
-/// 2. Raycast each sample point to the inner surface to find the bottom boundary
-/// 3. Pull back by min_wall_thickness
-/// 4. Resolve neighbor conflicts on the projected bottom points
-/// 5. Build the ruled-surface cutter mesh connecting top and bottom rings
+/// Pipeline:
+/// 1. Compute bottom rectangle dimensions from neighbor layout
+/// 2. For each seat, build the chimney cutter mesh
+/// 3. Resolve any remaining neighbor conflicts
 pub fn generate_azure_cutters(
     seats: &[StoneSeat],
     ring_mesh: &TriMesh,
     config: &AzureConfig,
-    segments: usize,
 ) -> Vec<AzureCutter> {
-    // Step 1 & 2: Project each seat's top circle to find bottom boundaries
-    let mut projected: Vec<ProjectedCutter> = seats
-        .iter()
-        .map(|seat| project_cutter_boundary(seat, ring_mesh, config, segments))
-        .collect();
+    // Step 1: Compute bottom rectangle extents for each seat based on neighbors
+    let bottom_rects = compute_bottom_rectangles(seats, config);
 
-    // Step 3: Resolve neighbor conflicts on the bottom boundaries
-    resolve_neighbor_conflicts_projected(&mut projected, seats, config.min_rib_width);
-
-    // Step 4: Build cutter meshes
+    // Step 2: Generate chimney cutter meshes
     let mut cutters = Vec::new();
-    for (proj, seat) in projected.iter().zip(seats.iter()) {
-        if proj.bottom_points.is_empty() {
-            log::warn!("Seat {}: no valid bottom projection, skipping", seat.id);
+    for (i, seat) in seats.iter().enumerate() {
+        let [half_w, half_h] = bottom_rects[i];
+
+        // Skip if the rectangle is too small to be meaningful
+        if half_w <= 0.01 || half_h <= 0.01 {
+            log::warn!("Seat {}: bottom rectangle too small ({:.2}×{:.2}), skipping",
+                seat.id, half_w * 2.0, half_h * 2.0);
             continue;
         }
 
-        let mesh = build_ruled_surface_cutter(
-            &proj.top_points,
-            &proj.bottom_points,
-            &seat.center,
-            &proj.bottom_center,
+        // Measure local metal thickness via raycast
+        let local_thickness = raycast_thickness(ring_mesh, &seat.center, &seat.inward);
+        if local_thickness <= config.min_wall_thickness + config.girdle_distance {
+            log::warn!("Seat {}: metal too thin ({:.2}mm) for azure cut, skipping",
+                seat.id, local_thickness);
+            continue;
+        }
+
+        let cylinder_radius = seat.radius + config.seat_margin;
+
+        let mesh = build_chimney_cutter(
+            seat,
+            cylinder_radius,
+            half_w,
+            half_h,
+            local_thickness,
+            config,
         );
 
         cutters.push(AzureCutter {
             seat_id: seat.id,
             mesh,
-            top_radius: proj.top_radius,
-            sample_depths: proj.depths.clone(),
+            cylinder_radius,
+            bottom_half_extents: [half_w, half_h],
         });
     }
 
@@ -86,123 +132,307 @@ pub fn generate_azure_cutters(
     cutters
 }
 
-/// Intermediate representation of a projected cutter before mesh generation.
-#[derive(Debug, Clone)]
-struct ProjectedCutter {
-    /// Points on the top circle (on the outer surface, stone side).
-    top_points: Vec<Point3<f64>>,
-    /// Points on the bottom boundary (projected onto inner surface - wall_thickness).
-    bottom_points: Vec<Point3<f64>>,
-    /// Center of the top circle.
-    top_center: Point3<f64>,
-    /// Centroid of the bottom boundary points.
-    bottom_center: Point3<f64>,
-    /// Per-sample ray depths (distance from top to inner surface hit).
-    depths: Vec<f64>,
-    /// Top radius for reference.
-    top_radius: f64,
+/// Compute the bottom rectangle half-extents for each stone seat
+/// based on the layout of neighboring stones.
+///
+/// For each seat, we find its nearest neighbors in two perpendicular
+/// directions (along the row and across the row) and derive the
+/// rectangle dimensions from the inter-stone spacing.
+///
+/// The two local axes are:
+///   - "row axis" (u): direction to the nearest neighbor (typically along the band)
+///   - "cross axis" (v): perpendicular to both u and the inward normal
+fn compute_bottom_rectangles(
+    seats: &[StoneSeat],
+    config: &AzureConfig,
+) -> Vec<[f64; 2]> {
+    let n = seats.len();
+    let mut rects = vec![[0.0f64; 2]; n];
+
+    for i in 0..n {
+        // Find distances to all other seats
+        let mut neighbor_dists: Vec<(usize, f64)> = (0..n)
+            .filter(|&j| j != i)
+            .map(|j| {
+                let d = nalgebra::distance(&seats[i].center, &seats[j].center);
+                (j, d)
+            })
+            .collect();
+        neighbor_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+        if neighbor_dists.is_empty() {
+            // Single stone — use a default square based on stone radius * 2
+            let default_half = seats[i].radius * 1.5;
+            rects[i] = [default_half, default_half];
+            continue;
+        }
+
+        // Nearest neighbor defines the "row" direction
+        let nearest_idx = neighbor_dists[0].0;
+        let nearest_dist = neighbor_dists[0].1;
+        let row_dir = (seats[nearest_idx].center - seats[i].center).normalize();
+
+        // Half-width along row direction:
+        // Available space = distance to neighbor, minus both stones' radii safety, minus rib
+        let half_w = ((nearest_dist - config.min_rib_width) / 2.0)
+            .max(seats[i].radius + config.seat_margin);
+
+        // For cross direction, find nearest neighbor that is NOT roughly along the row
+        let inward = seats[i].inward.normalize();
+        let cross_dir = inward.cross(&row_dir).normalize();
+
+        let mut min_cross_dist = f64::MAX;
+        for &(j, dist) in &neighbor_dists {
+            let to_j = (seats[j].center - seats[i].center).normalize();
+            let cross_component = to_j.dot(&cross_dir).abs();
+            // If this neighbor has significant cross-direction component
+            if cross_component > 0.5 {
+                let cross_dist = dist * cross_component;
+                min_cross_dist = min_cross_dist.min(cross_dist);
+            }
+        }
+
+        let half_h = if min_cross_dist < f64::MAX {
+            ((min_cross_dist - config.min_rib_width) / 2.0)
+                .max(seats[i].radius + config.seat_margin)
+        } else {
+            // No cross-direction neighbor found — use same as width
+            half_w
+        };
+
+        rects[i] = [half_w, half_h];
+
+        log::debug!(
+            "Seat {}: bottom rect = {:.2} × {:.2} mm (nearest neighbor at {:.2}mm)",
+            seats[i].id, half_w * 2.0, half_h * 2.0, nearest_dist
+        );
+    }
+
+    rects
 }
 
-/// Project a single seat's top circle onto the inner surface.
+/// Build a chimney-shaped cutter mesh for a single stone seat.
 ///
-/// For each of N sample points on the top circle:
-///   1. Compute point on the circle: center + r*(cos(θ)*u + sin(θ)*v)
-///   2. Cast ray from that point along the inward normal
-///   3. Find where it hits the inner surface (closest triangle)
-///   4. Pull back by min_wall_thickness along the ray direction
-///   5. Apply taper: expand radially by tan(taper_angle) * depth
+/// Structure:
+///   1. Top cap: circular, at the stone seat level
+///   2. Cylinder walls: straight down for girdle_distance
+///   3. Optional step: flat ring at cylinder-to-pyramid transition
+///   4. Pyramid walls: cylinder circle → bottom rectangle
+///   5. Bottom cap: rectangular, at (total_depth + overhang) below seat
 ///
-/// The result is a set of bottom boundary points whose shape naturally
-/// conforms to whatever the inner surface geometry is.
-fn project_cutter_boundary(
+/// All oriented along the seat's inward normal.
+fn build_chimney_cutter(
     seat: &StoneSeat,
-    ring_mesh: &TriMesh,
+    cyl_radius: f64,
+    half_w: f64,
+    half_h: f64,
+    local_thickness: f64,
     config: &AzureConfig,
-    segments: usize,
-) -> ProjectedCutter {
-    let top_radius = seat.radius + config.seat_margin;
+) -> TriMesh {
     let axis = seat.inward.normalize();
-    let taper_rad = config.taper_angle.to_radians();
+    let segments = config.cylinder_segments;
 
-    // Build local coordinate frame on the outer surface at the stone seat
-    let arbitrary = if axis.x.abs() < 0.9 {
-        Vector3::x()
-    } else {
-        Vector3::y()
-    };
-    let u_axis = axis.cross(&arbitrary).normalize();
-    let v_axis = axis.cross(&u_axis).normalize();
+    // Build local coordinate frame
+    let arbitrary = if axis.x.abs() < 0.9 { Vector3::x() } else { Vector3::y() };
+    let u_axis = axis.cross(&arbitrary).normalize(); // "width" direction
+    let v_axis = axis.cross(&u_axis).normalize();     // "height" direction
 
-    let mut top_points = Vec::with_capacity(segments);
-    let mut bottom_points = Vec::with_capacity(segments);
-    let mut depths = Vec::with_capacity(segments);
+    // Key depths along the axis (measured from seat center, positive = inward)
+    let d_cylinder_end = config.girdle_distance;
+    let d_step_end = d_cylinder_end + config.step_height;
+    let d_pyramid_end = local_thickness - config.min_wall_thickness;
+    let d_bottom = d_pyramid_end + config.overhang; // extends past inner surface
 
+    // Ensure pyramid zone has positive height
+    let _pyramid_height = (d_pyramid_end - d_step_end).max(0.001);
+
+    let mut vertices = Vec::new();
+    let mut faces = Vec::new();
+
+    // =========================================
+    // RING 0: Top circle (at stone seat level, z=0)
+    // =========================================
+    let top_center_idx = vertices.len();
+    vertices.push(seat.center);
+
+    let ring0_start = vertices.len();
     for i in 0..segments {
         let angle = 2.0 * PI * (i as f64) / (segments as f64);
-        let radial_dir = u_axis * angle.cos() + v_axis * angle.sin();
+        let offset = u_axis * angle.cos() * cyl_radius + v_axis * angle.sin() * cyl_radius;
+        vertices.push(seat.center + offset);
+    }
 
-        // Point on the top circle
-        let top_pt = seat.center + radial_dir * top_radius;
-        top_points.push(top_pt);
+    // =========================================
+    // RING 1: Bottom of cylinder (z = girdle_distance)
+    // =========================================
+    let cyl_bottom_center = seat.center + axis * d_cylinder_end;
+    let ring1_start = vertices.len();
+    for i in 0..segments {
+        let angle = 2.0 * PI * (i as f64) / (segments as f64);
+        let offset = u_axis * angle.cos() * cyl_radius + v_axis * angle.sin() * cyl_radius;
+        vertices.push(cyl_bottom_center + offset);
+    }
 
-        // Cast ray inward from this point
-        let ray_origin = top_pt;
-        let ray_dir = axis;
+    // =========================================
+    // RING 2: Bottom of step (z = girdle_distance + step_height)
+    //         Same radius as cylinder — flat shelf
+    // =========================================
+    let step_bottom_center = seat.center + axis * d_step_end;
+    let ring2_start = vertices.len();
+    if config.step_height > 0.0 {
+        for i in 0..segments {
+            let angle = 2.0 * PI * (i as f64) / (segments as f64);
+            let offset = u_axis * angle.cos() * cyl_radius + v_axis * angle.sin() * cyl_radius;
+            vertices.push(step_bottom_center + offset);
+        }
+    }
+    let ring2_exists = config.step_height > 0.0;
 
-        match raycast_to_surface(ring_mesh, &ray_origin, &ray_dir) {
-            Some(hit_distance) => {
-                // The depth available for the azure cut
-                let usable_depth = (hit_distance - config.min_wall_thickness).max(0.0);
-                depths.push(usable_depth);
+    // =========================================
+    // RING 3: Bottom rectangle (z = d_bottom)
+    //         4 corners of the rectangle
+    // =========================================
+    let bottom_center_pos = seat.center + axis * d_bottom;
+    let bottom_center_idx = vertices.len();
+    vertices.push(bottom_center_pos);
 
-                // Bottom point: travel along ray by usable_depth,
-                // then expand radially by taper
-                let depth_point = ray_origin + ray_dir * usable_depth;
+    // Rectangle corners: +w+h, -w+h, -w-h, +w-h
+    let rect_start = vertices.len();
+    let rect_corners = [
+        bottom_center_pos + u_axis * half_w + v_axis * half_h,
+        bottom_center_pos - u_axis * half_w + v_axis * half_h,
+        bottom_center_pos - u_axis * half_w - v_axis * half_h,
+        bottom_center_pos + u_axis * half_w - v_axis * half_h,
+    ];
+    for corner in &rect_corners {
+        vertices.push(*corner);
+    }
 
-                // Taper expansion: at this depth, expand outward from the seat axis
-                let taper_expansion = usable_depth * taper_rad.tan();
-                let bottom_pt = depth_point + radial_dir * taper_expansion;
+    // Also add midpoints along each rectangle edge for smoother transition
+    let rect_mid_start = vertices.len();
+    let rect_midpoints = [
+        bottom_center_pos + v_axis * half_h,                      // mid top edge
+        bottom_center_pos - u_axis * half_w,                      // mid left edge
+        bottom_center_pos - v_axis * half_h,                      // mid bottom edge
+        bottom_center_pos + u_axis * half_w,                      // mid right edge
+    ];
+    for mid in &rect_midpoints {
+        vertices.push(*mid);
+    }
 
-                bottom_points.push(bottom_pt);
-            }
-            None => {
-                // No hit — this sample can't project. Use a zero-depth fallback.
-                log::debug!(
-                    "Seat {}: ray from sample {} found no inner surface hit",
-                    seat.id, i
-                );
-                depths.push(0.0);
-                bottom_points.push(top_pt); // degenerate: bottom = top
-            }
+    // =========================================
+    // FACES
+    // =========================================
+
+    // --- Top cap: fan from center ---
+    for i in 0..segments {
+        let next = (i + 1) % segments;
+        // Winding for outward normal (opposite to axis)
+        faces.push([top_center_idx, ring0_start + next, ring0_start + i]);
+    }
+
+    // --- Cylinder walls: ring0 → ring1 ---
+    for i in 0..segments {
+        let next = (i + 1) % segments;
+        faces.push([ring0_start + i, ring1_start + i, ring0_start + next]);
+        faces.push([ring0_start + next, ring1_start + i, ring1_start + next]);
+    }
+
+    // --- Step walls (if step exists): ring1 → ring2 ---
+    if ring2_exists {
+        for i in 0..segments {
+            let next = (i + 1) % segments;
+            faces.push([ring1_start + i, ring2_start + i, ring1_start + next]);
+            faces.push([ring1_start + next, ring2_start + i, ring2_start + next]);
         }
     }
 
-    let bottom_center = if !bottom_points.is_empty() {
-        let sum: Vector3<f64> = bottom_points.iter().map(|p| p.coords).sum();
-        Point3::from(sum / bottom_points.len() as f64)
-    } else {
-        seat.center
-    };
+    // --- Transition zone: circle (ring1 or ring2) → rectangle ---
+    // This is the key geometry: connecting a circular ring to 4 rectangle corners + 4 midpoints.
+    // We map each segment of the circle to the nearest point on the rectangle boundary.
+    let transition_ring_start = if ring2_exists { ring2_start } else { ring1_start };
 
-    ProjectedCutter {
-        top_points,
-        bottom_points,
-        top_center: seat.center,
-        bottom_center,
-        depths,
-        top_radius,
+    // Build the rectangle boundary as 8 points (4 corners + 4 midpoints) in order
+    // Going clockwise: corner0, mid0, corner1, mid1, corner2, mid2, corner3, mid3
+    let rect_boundary: Vec<usize> = vec![
+        rect_start + 0, rect_mid_start + 0,  // corner TL, mid top
+        rect_start + 1, rect_mid_start + 1,  // corner BL, mid left
+        rect_start + 2, rect_mid_start + 2,  // corner BR, mid bottom
+        rect_start + 3, rect_mid_start + 3,  // corner TR, mid right
+    ];
+    let rect_count = rect_boundary.len(); // 8
+
+    // Map each cylinder segment to its closest rectangle boundary point
+    for i in 0..segments {
+        let next = (i + 1) % segments;
+        let _cyl_pt = &vertices[transition_ring_start + i];
+
+        // Find which rectangle boundary segment this cylinder point maps to
+        let rect_idx = map_circle_to_rect_index(i, segments, rect_count);
+        let rect_next = map_circle_to_rect_index(next, segments, rect_count);
+
+        let ri = rect_boundary[rect_idx];
+        let ri_next = rect_boundary[rect_next];
+
+        if rect_idx == rect_next {
+            // Both circle points map to the same rect point — single triangle
+            faces.push([transition_ring_start + i, ri, transition_ring_start + next]);
+        } else {
+            // Quad between circle edge and rect edge
+            faces.push([transition_ring_start + i, ri, transition_ring_start + next]);
+            faces.push([transition_ring_start + next, ri, ri_next]);
+        }
     }
+
+    // --- Bottom cap: rectangle fan from center ---
+    // 4 triangles from center to each rectangle edge
+    for i in 0..4 {
+        let c0 = rect_start + i;
+        let mid = rect_mid_start + i;
+        let c1 = rect_start + (i + 1) % 4;
+        faces.push([bottom_center_idx, c0, mid]);
+        faces.push([bottom_center_idx, mid, c1]);
+    }
+
+    // Compute per-face normals
+    let normals = faces
+        .iter()
+        .map(|f| {
+            let e1 = vertices[f[1]] - vertices[f[0]];
+            let e2 = vertices[f[2]] - vertices[f[0]];
+            let n = e1.cross(&e2);
+            if n.norm() > 1e-12 { n.normalize() } else { Vector3::z() }
+        })
+        .collect();
+
+    TriMesh { vertices, faces, normals }
 }
 
-/// Raycast from `origin` in direction `dir` against the mesh.
-/// Returns the distance to the first hit (beyond a small epsilon to skip self-hits).
+/// Map a cylinder segment index to the nearest rectangle boundary index.
 ///
-/// This is the same Möller–Trumbore approach but we only care about the closest hit.
-fn raycast_to_surface(
+/// The circle has `segments` points, the rectangle has `rect_count` points.
+/// We map by angle: each rectangle point sits at a known angle, and we
+/// find which rectangle segment the circle point falls in.
+fn map_circle_to_rect_index(circle_idx: usize, segments: usize, rect_count: usize) -> usize {
+    // Circle point angle (0..2π)
+    let angle = 2.0 * PI * (circle_idx as f64) / (segments as f64);
+
+    // Rectangle boundary points are evenly spaced in angle for simplicity
+    // (corners at 45°, 135°, 225°, 315°; midpoints at 0°, 90°, 180°, 270°)
+    // But our ordering is: corner0(45°), mid0(90°), corner1(135°), mid1(180°), ...
+    //
+    // Simpler: map linearly
+    let frac = angle / (2.0 * PI); // 0.0 .. 1.0
+    let idx = (frac * rect_count as f64).floor() as usize;
+    idx.min(rect_count - 1)
+}
+
+/// Raycast from `origin` in direction `dir` to find the inner surface distance.
+fn raycast_thickness(
     mesh: &TriMesh,
     origin: &Point3<f64>,
     dir: &Vector3<f64>,
-) -> Option<f64> {
+) -> f64 {
     let dir_norm = dir.normalize();
     let mut min_t = f64::MAX;
 
@@ -212,17 +442,18 @@ fn raycast_to_surface(
         let v2 = mesh.vertices[face[2]];
 
         if let Some(t) = ray_triangle_intersect(origin, &dir_norm, &v0, &v1, &v2) {
-            // Skip self-intersection at the hole boundary (small epsilon)
             if t > 0.05 && t < min_t {
                 min_t = t;
             }
         }
     }
 
-    if min_t < f64::MAX {
-        Some(min_t)
+    if min_t == f64::MAX {
+        log::warn!("Raycast found no hit from ({:.2},{:.2},{:.2}) — defaulting thickness to 2.0",
+            origin.x, origin.y, origin.z);
+        2.0 // safe fallback
     } else {
-        None
+        min_t
     }
 }
 
@@ -239,179 +470,16 @@ fn ray_triangle_intersect(
     let edge2 = v2 - v0;
     let h = dir.cross(&edge2);
     let a = edge1.dot(&h);
-
-    if a.abs() < epsilon {
-        return None;
-    }
-
+    if a.abs() < epsilon { return None; }
     let f = 1.0 / a;
     let s = origin - v0;
     let u = f * s.dot(&h);
-    if !(0.0..=1.0).contains(&u) {
-        return None;
-    }
-
+    if !(0.0..=1.0).contains(&u) { return None; }
     let q = s.cross(&edge1);
     let v = f * dir.dot(&q);
-    if v < 0.0 || u + v > 1.0 {
-        return None;
-    }
-
+    if v < 0.0 || u + v > 1.0 { return None; }
     let t = f * edge2.dot(&q);
     if t > epsilon { Some(t) } else { None }
-}
-
-/// Resolve neighbor conflicts on projected bottom boundaries.
-///
-/// For each pair of neighboring seats, check if any bottom boundary points
-/// from the two cutters are too close (less than min_rib_width apart).
-/// If so, shrink the offending bottom points inward toward the seat axis
-/// until the constraint is satisfied.
-///
-/// This is more sophisticated than the old radius-based approach because
-/// the bottom boundaries are now freeform curves, not circles.
-fn resolve_neighbor_conflicts_projected(
-    cutters: &mut [ProjectedCutter],
-    seats: &[StoneSeat],
-    min_rib_width: f64,
-) {
-    let n = cutters.len();
-
-    for i in 0..n {
-        for j in (i + 1)..n {
-            // Quick check: are these seats close enough to potentially conflict?
-            let seat_dist = nalgebra::distance(&seats[i].center, &seats[j].center);
-            let max_possible_reach = cutters[i].top_radius * 3.0 + cutters[j].top_radius * 3.0;
-            if seat_dist > max_possible_reach {
-                continue;
-            }
-
-            // For each bottom point in cutter i, check distance to the
-            // nearest bottom point in cutter j. If too close, pull both inward.
-            let segments = cutters[i].bottom_points.len();
-            for si in 0..segments {
-                for sj in 0..cutters[j].bottom_points.len() {
-                    let dist = nalgebra::distance(
-                        &cutters[i].bottom_points[si],
-                        &cutters[j].bottom_points[sj],
-                    );
-
-                    if dist < min_rib_width && dist > 1e-10 {
-                        // Pull both points toward their respective seat centers
-                        let deficit = min_rib_width - dist;
-                        let pull_each = deficit / 2.0 + 0.01; // slight overshoot for safety
-
-                        // Pull point i toward seat i center
-                        let dir_i = (cutters[i].bottom_center - cutters[i].bottom_points[si])
-                            .try_normalize(1e-10);
-                        if let Some(d) = dir_i {
-                            cutters[i].bottom_points[si] += d * pull_each;
-                        }
-
-                        // Pull point j toward seat j center
-                        let dir_j = (cutters[j].bottom_center - cutters[j].bottom_points[sj])
-                            .try_normalize(1e-10);
-                        if let Some(d) = dir_j {
-                            cutters[j].bottom_points[sj] += d * pull_each;
-                        }
-
-                        log::debug!(
-                            "Neighbor conflict seats {} & {}: samples ({},{}) dist={:.3}mm, pulled by {:.3}mm each",
-                            i, j, si, sj, dist, pull_each
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Build a ruled-surface cutter mesh connecting the top ring to the bottom ring.
-///
-/// This is a generalized frustum where:
-/// - The top ring is a circle (all points at same radius from top_center)
-/// - The bottom ring is a freeform curve (projected onto the inner surface)
-/// - Side walls are triangle strips connecting corresponding top/bottom samples
-/// - Top and bottom caps close the solid for boolean operations
-///
-/// The resulting solid correctly handles:
-/// - Flat surfaces (bottom ring = circle → standard frustum)
-/// - Cylindrical surfaces (bottom ring = ellipse → tapered elliptical cone)
-/// - S-curves (bottom ring = asymmetric curve → warped cutter)
-/// - Domes (bottom ring = warped circle → dome-following cutter)
-fn build_ruled_surface_cutter(
-    top_ring: &[Point3<f64>],
-    bottom_ring: &[Point3<f64>],
-    top_center: &Point3<f64>,
-    bottom_center: &Point3<f64>,
-) -> TriMesh {
-    assert_eq!(top_ring.len(), bottom_ring.len(), "Ring sample counts must match");
-    let segments = top_ring.len();
-
-    let mut vertices = Vec::new();
-    let mut faces = Vec::new();
-
-    // Vertex layout:
-    // [0]                    = top center
-    // [1..=segments]         = top ring
-    // [segments+1]           = bottom center
-    // [segments+2..=2*seg+1] = bottom ring
-
-    let top_center_idx = 0;
-    vertices.push(*top_center);
-
-    let top_ring_start = vertices.len();
-    for pt in top_ring {
-        vertices.push(*pt);
-    }
-
-    let bottom_center_idx = vertices.len();
-    vertices.push(*bottom_center);
-
-    let bottom_ring_start = vertices.len();
-    for pt in bottom_ring {
-        vertices.push(*pt);
-    }
-
-    // Top cap: fan from top_center to top ring (winding for outward normal)
-    for i in 0..segments {
-        let next = (i + 1) % segments;
-        faces.push([top_center_idx, top_ring_start + next, top_ring_start + i]);
-    }
-
-    // Bottom cap: fan from bottom_center to bottom ring
-    for i in 0..segments {
-        let next = (i + 1) % segments;
-        faces.push([bottom_center_idx, bottom_ring_start + i, bottom_ring_start + next]);
-    }
-
-    // Side walls: triangle strip connecting top ring to bottom ring
-    for i in 0..segments {
-        let next = (i + 1) % segments;
-        let t0 = top_ring_start + i;
-        let t1 = top_ring_start + next;
-        let b0 = bottom_ring_start + i;
-        let b1 = bottom_ring_start + next;
-
-        faces.push([t0, b0, t1]);
-        faces.push([t1, b0, b1]);
-    }
-
-    // Compute per-face normals
-    let normals = faces
-        .iter()
-        .map(|f| {
-            let e1 = vertices[f[1]] - vertices[f[0]];
-            let e2 = vertices[f[2]] - vertices[f[0]];
-            e1.cross(&e2).normalize()
-        })
-        .collect();
-
-    TriMesh {
-        vertices,
-        faces,
-        normals,
-    }
 }
 
 #[cfg(test)]
@@ -419,61 +487,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ruled_surface_flat() {
-        // Flat case: top and bottom are both circles → should behave like old frustum
-        let segments = 16;
-        let mut top_ring = Vec::new();
-        let mut bottom_ring = Vec::new();
+    fn test_chimney_cutter_vertex_count() {
+        let seat = StoneSeat {
+            id: 0,
+            center: Point3::origin(),
+            radius: 0.75,
+            normal: Vector3::z(),
+            inward: -Vector3::z(),
+            local_thickness: 3.0,
+            boundary_vertices: vec![],
+        };
 
-        for i in 0..segments {
-            let angle = 2.0 * PI * (i as f64) / (segments as f64);
-            top_ring.push(Point3::new(angle.cos() * 1.0, angle.sin() * 1.0, 0.0));
-            bottom_ring.push(Point3::new(angle.cos() * 2.0, angle.sin() * 2.0, 3.0));
-        }
+        let config = AzureConfig {
+            girdle_distance: 0.5,
+            taper_angle: 15.0,
+            step_height: 0.0,      // no step
+            overhang: 0.1,
+            min_wall_thickness: 0.5,
+            min_rib_width: 0.4,
+            seat_margin: 0.2,
+            cylinder_segments: 16,
+        };
 
-        let top_center = Point3::new(0.0, 0.0, 0.0);
-        let bottom_center = Point3::new(0.0, 0.0, 3.0);
+        let mesh = build_chimney_cutter(&seat, 0.95, 1.5, 1.2, 3.0, &config);
 
-        let mesh = build_ruled_surface_cutter(&top_ring, &bottom_ring, &top_center, &bottom_center);
-
-        // top_center(1) + top_ring(16) + bottom_center(1) + bottom_ring(16) = 34
-        assert_eq!(mesh.vertices.len(), 34);
-        // top_cap(16) + bottom_cap(16) + sides(32) = 64
-        assert_eq!(mesh.faces.len(), 64);
+        // Vertices: top_center(1) + ring0(16) + ring1(16) + bottom_center(1) + rect_corners(4) + rect_mids(4)
+        // No step → no ring2
+        assert_eq!(mesh.vertices.len(), 1 + 16 + 16 + 1 + 4 + 4);
     }
 
     #[test]
-    fn test_ruled_surface_elliptical() {
-        // Cylindrical projection: bottom is an ellipse
-        let segments = 16;
-        let mut top_ring = Vec::new();
-        let mut bottom_ring = Vec::new();
+    fn test_chimney_cutter_with_step() {
+        let seat = StoneSeat {
+            id: 0,
+            center: Point3::origin(),
+            radius: 0.75,
+            normal: Vector3::z(),
+            inward: -Vector3::z(),
+            local_thickness: 3.0,
+            boundary_vertices: vec![],
+        };
 
-        for i in 0..segments {
-            let angle = 2.0 * PI * (i as f64) / (segments as f64);
-            // Top: circle r=1
-            top_ring.push(Point3::new(angle.cos(), angle.sin(), 0.0));
-            // Bottom: ellipse a=2.0, b=1.5 (cylinder stretch in x)
-            bottom_ring.push(Point3::new(angle.cos() * 2.0, angle.sin() * 1.5, 3.0));
-        }
+        let config = AzureConfig {
+            girdle_distance: 0.5,
+            taper_angle: 15.0,
+            step_height: 0.3,      // with step
+            overhang: 0.1,
+            min_wall_thickness: 0.5,
+            min_rib_width: 0.4,
+            seat_margin: 0.2,
+            cylinder_segments: 16,
+        };
 
-        let top_center = Point3::origin();
-        let bottom_center = Point3::new(0.0, 0.0, 3.0);
+        let mesh = build_chimney_cutter(&seat, 0.95, 1.5, 1.2, 3.0, &config);
 
-        let mesh = build_ruled_surface_cutter(&top_ring, &bottom_ring, &top_center, &bottom_center);
-
-        assert_eq!(mesh.vertices.len(), 34);
-        assert_eq!(mesh.faces.len(), 64);
-
-        // Verify bottom ring has elliptical shape (x extent > y extent)
-        let max_x: f64 = bottom_ring.iter().map(|p| p.x.abs()).fold(0.0, f64::max);
-        let max_y: f64 = bottom_ring.iter().map(|p| p.y.abs()).fold(0.0, f64::max);
-        assert!(max_x > max_y, "Bottom should be elliptical: x={:.2} > y={:.2}", max_x, max_y);
+        // With step: adds ring2(16)
+        assert_eq!(mesh.vertices.len(), 1 + 16 + 16 + 16 + 1 + 4 + 4);
     }
 
     #[test]
-    fn test_neighbor_conflict_projected() {
-        // Two adjacent cutters with bottom points that are too close
+    fn test_bottom_rectangles_two_stones() {
+        let config = AzureConfig {
+            girdle_distance: 0.5,
+            taper_angle: 15.0,
+            step_height: 0.0,
+            overhang: 0.1,
+            min_wall_thickness: 0.5,
+            min_rib_width: 0.4,
+            seat_margin: 0.2,
+            cylinder_segments: 32,
+        };
+
         let seats = vec![
             StoneSeat {
                 id: 0,
@@ -486,7 +570,7 @@ mod tests {
             },
             StoneSeat {
                 id: 1,
-                center: Point3::new(2.0, 0.0, 0.0),
+                center: Point3::new(3.0, 0.0, 0.0), // 3mm apart
                 radius: 0.5,
                 normal: Vector3::z(),
                 inward: -Vector3::z(),
@@ -495,47 +579,23 @@ mod tests {
             },
         ];
 
-        // Manually place bottom points that nearly touch
-        let mut cutters = vec![
-            ProjectedCutter {
-                top_points: vec![Point3::new(0.5, 0.0, 0.0)],
-                bottom_points: vec![Point3::new(0.95, 0.0, -1.5)], // close to seat 1
-                top_center: Point3::new(0.0, 0.0, 0.0),
-                bottom_center: Point3::new(0.0, 0.0, -1.5),
-                depths: vec![1.5],
-                top_radius: 0.7,
-            },
-            ProjectedCutter {
-                top_points: vec![Point3::new(1.5, 0.0, 0.0)],
-                bottom_points: vec![Point3::new(1.05, 0.0, -1.5)], // close to seat 0
-                top_center: Point3::new(2.0, 0.0, 0.0),
-                bottom_center: Point3::new(2.0, 0.0, -1.5),
-                depths: vec![1.5],
-                top_radius: 0.7,
-            },
-        ];
+        let rects = compute_bottom_rectangles(&seats, &config);
 
-        let min_rib = 0.4;
-        // Before: distance between bottom points = 0.1mm (less than 0.4)
-        let dist_before = nalgebra::distance(
-            &cutters[0].bottom_points[0],
-            &cutters[1].bottom_points[0],
-        );
-        assert!(dist_before < min_rib);
+        // Available along row = (3.0 - 0.4) / 2 = 1.3
+        // half_w should be 1.3
+        assert!(rects[0][0] > 0.5, "half_w should be > stone radius");
+        assert!(rects[0][0] <= 1.3 + 0.01, "half_w should respect rib width");
+    }
 
-        resolve_neighbor_conflicts_projected(&mut cutters, &seats, min_rib);
-
-        // After: distance should be >= min_rib_width
-        let dist_after = nalgebra::distance(
-            &cutters[0].bottom_points[0],
-            &cutters[1].bottom_points[0],
-        );
-        assert!(
-            dist_after >= min_rib - 0.05, // small tolerance for floating point
-            "After resolution, dist={:.3} should be >= {:.3}",
-            dist_after,
-            min_rib
-        );
+    #[test]
+    fn test_circle_to_rect_mapping() {
+        // 32 circle segments, 8 rect points
+        // Segment 0 (angle=0) should map to rect index 0
+        assert_eq!(map_circle_to_rect_index(0, 32, 8), 0);
+        // Segment 4 (angle=π/4) should map to rect index 1
+        assert_eq!(map_circle_to_rect_index(4, 32, 8), 1);
+        // Segment 16 (angle=π) should map to rect index 4
+        assert_eq!(map_circle_to_rect_index(16, 32, 8), 4);
     }
 
     #[test]
@@ -545,9 +605,8 @@ mod tests {
         let v0 = Point3::new(-5.0, -5.0, 2.0);
         let v1 = Point3::new(5.0, -5.0, 2.0);
         let v2 = Point3::new(0.0, 5.0, 2.0);
-
         let t = ray_triangle_intersect(&origin, &dir, &v0, &v1, &v2);
         assert!(t.is_some());
-        assert!((t.unwrap() - 3.0).abs() < 1e-6); // from z=-1 to z=2 = distance 3
+        assert!((t.unwrap() - 3.0).abs() < 1e-6);
     }
 }
