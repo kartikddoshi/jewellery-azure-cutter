@@ -35,27 +35,22 @@ pub struct StoneConfig {
     pub diameter_max: f64,
 }
 
-/// Shape of the bottom opening of the azure cut.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BottomShape {
-    /// Rectangular bottom — 4-sided, good for linear stone rows.
-    Rectangle,
-    /// Hexagonal bottom — 6-sided honeycomb pattern, optimal for clustered
-    /// round stone layouts on domed/curved surfaces. Better tessellation,
-    /// more uniform rib walls, and less wasted metal.
-    Hexagon,
-}
-
-impl Default for BottomShape {
-    fn default() -> Self { BottomShape::Rectangle }
-}
-
 /// Azure cut generation parameters.
 ///
 /// The azure cutter is shaped like a chimney:
 ///   - TOP: A cylinder matching the stone hole, extending inward
-///   - BOTTOM: A tapered polygon (rectangle or hexagon) widening toward the inner surface
+///   - BOTTOM: A Voronoi-derived polygon that expands until it meets neighbors
+///
+/// The bottom shape is NOT predefined (not always a rectangle or hexagon).
+/// It is computed automatically from the stone layout:
+///   - Each stone's cut expands outward from the cylinder
+///   - Expansion is limited by the taper angle
+///   - Neighboring cuts are separated by minimum rib walls
+///   - The result is the Voronoi cell (perpendicular bisector intersection)
+///     of each stone, clipped to the taper circle
+///
+/// This means the bottom could be a triangle (3 neighbors), pentagon,
+/// irregular quad, or any convex polygon — whatever the geometry dictates.
 ///
 /// ```text
 ///        ┌──────┐         ← Stone hole (circle)
@@ -64,9 +59,9 @@ impl Default for BottomShape {
 ///        │      │
 ///        ├──┐┌──┤         ← step (flat ledge at transition)
 ///       /   ││   \
-///      / PYRAMID  \  ← taper controls the widening angle
+///      / PYRAMID  \  ← taper controls max expansion
 ///     /     ││     \
-///    └──────┘└──────┘     ← bottom polygon on inner surface
+///    └──────┘└──────┘     ← bottom = Voronoi cell ∩ taper circle
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct AzureConfig {
@@ -80,7 +75,8 @@ pub struct AzureConfig {
     // --- Pyramid (bottom) zone ---
 
     /// Taper angle of the pyramid walls from vertical (degrees).
-    /// Controls how quickly the bottom polygon widens from the cylinder base.
+    /// Controls the maximum expansion of the bottom polygon from the cylinder.
+    /// The cut widens by tan(taper_angle) * pyramid_height on each side.
     #[serde(default = "default_taper_angle")]
     pub taper_angle: f64,
 
@@ -101,7 +97,8 @@ pub struct AzureConfig {
     pub min_wall_thickness: f64,
 
     /// Minimum metal rib width between adjacent azure cuts (mm).
-    /// This constrains the bottom polygon dimensions.
+    /// This constrains the Voronoi cell boundaries — each bisector is
+    /// offset inward by half this value.
     #[serde(default = "default_min_rib_width")]
     pub min_rib_width: f64,
 
@@ -112,15 +109,9 @@ pub struct AzureConfig {
     // --- Resolution ---
 
     /// Number of segments for the cylinder cross-section (polygon approximation).
+    /// Also used as the initial resolution for the taper circle before clipping.
     #[serde(default = "default_cylinder_segments")]
     pub cylinder_segments: usize,
-
-    // --- Bottom shape ---
-
-    /// Shape of the bottom opening: "rectangle" (default) or "hexagon" (honeycomb).
-    /// Hexagons tessellate better for clustered round stones on domed surfaces.
-    #[serde(default)]
-    pub bottom_shape: BottomShape,
 }
 
 // --- Defaults ---
