@@ -26,3 +26,7 @@ seat_margin = 0.2         # Radial safety zone around stone hole edge (mm)
 
 # --- Resolution ---
 cylinder_segments = 32    # Polygon segments for the cylinder cross-section
+
+# --- Bottom shape ---
+# bottom_shape = "rectangle"  # "rectangle" (default) or "hexagon" (honeycomb)
+                              # Hexagon is better for clustered round stones on domed surfaces

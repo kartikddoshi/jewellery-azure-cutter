@@ -35,11 +35,27 @@ pub struct StoneConfig {
     pub diameter_max: f64,
 }
 
+/// Shape of the bottom opening of the azure cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BottomShape {
+    /// Rectangular bottom — 4-sided, good for linear stone rows.
+    Rectangle,
+    /// Hexagonal bottom — 6-sided honeycomb pattern, optimal for clustered
+    /// round stone layouts on domed/curved surfaces. Better tessellation,
+    /// more uniform rib walls, and less wasted metal.
+    Hexagon,
+}
+
+impl Default for BottomShape {
+    fn default() -> Self { BottomShape::Rectangle }
+}
+
 /// Azure cut generation parameters.
 ///
 /// The azure cutter is shaped like a chimney:
 ///   - TOP: A cylinder matching the stone hole, extending inward
-///   - BOTTOM: A tapered rectangular pyramid widening toward the inner surface
+///   - BOTTOM: A tapered polygon (rectangle or hexagon) widening toward the inner surface
 ///
 /// ```text
 ///        ┌──────┐         ← Stone hole (circle)
@@ -50,7 +66,7 @@ pub struct StoneConfig {
 ///       /   ││   \
 ///      / PYRAMID  \  ← taper controls the widening angle
 ///     /     ││     \
-///    └──────┘└──────┘     ← bottom rectangle on inner surface
+///    └──────┘└──────┘     ← bottom polygon on inner surface
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct AzureConfig {
@@ -64,7 +80,7 @@ pub struct AzureConfig {
     // --- Pyramid (bottom) zone ---
 
     /// Taper angle of the pyramid walls from vertical (degrees).
-    /// Controls how quickly the rectangle widens from the cylinder base.
+    /// Controls how quickly the bottom polygon widens from the cylinder base.
     #[serde(default = "default_taper_angle")]
     pub taper_angle: f64,
 
@@ -85,7 +101,7 @@ pub struct AzureConfig {
     pub min_wall_thickness: f64,
 
     /// Minimum metal rib width between adjacent azure cuts (mm).
-    /// This constrains the bottom rectangle dimensions.
+    /// This constrains the bottom polygon dimensions.
     #[serde(default = "default_min_rib_width")]
     pub min_rib_width: f64,
 
@@ -98,6 +114,13 @@ pub struct AzureConfig {
     /// Number of segments for the cylinder cross-section (polygon approximation).
     #[serde(default = "default_cylinder_segments")]
     pub cylinder_segments: usize,
+
+    // --- Bottom shape ---
+
+    /// Shape of the bottom opening: "rectangle" (default) or "hexagon" (honeycomb).
+    /// Hexagons tessellate better for clustered round stones on domed surfaces.
+    #[serde(default)]
+    pub bottom_shape: BottomShape,
 }
 
 // --- Defaults ---
